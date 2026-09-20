@@ -24,23 +24,28 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
+          # Install LLVM/Clang via official LLVM script (always gets latest stable)
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18 || \
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 17 || \
+          sudo apt-get install -y clang lld llvm
+          # Install build deps
           sudo apt-get install -y --no-install-recommends \
             git curl wget zip unzip bc bison flex libssl-dev libelf-dev \
             python3 cpio build-essential gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi make libncurses-dev lz4 zstd \
-            clang-17 lld-17 llvm-17
-          # Create unversioned symlinks
-          sudo ln -sf /usr/bin/clang-17 /usr/local/bin/clang
-          sudo ln -sf /usr/bin/ld.lld-17 /usr/local/bin/ld.lld
-          sudo ln -sf /usr/bin/llvm-ar-17 /usr/local/bin/llvm-ar
-          sudo ln -sf /usr/bin/llvm-nm-17 /usr/local/bin/llvm-nm
-          sudo ln -sf /usr/bin/llvm-objcopy-17 /usr/local/bin/llvm-objcopy
-          sudo ln -sf /usr/bin/llvm-objdump-17 /usr/local/bin/llvm-objdump
-          sudo ln -sf /usr/bin/llvm-strip-17 /usr/local/bin/llvm-strip
+            gcc-arm-linux-gnueabi make libncurses-dev lz4 zstd
+          # Create/find unversioned symlinks
+          CLANG_VER=$(clang --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1 | cut -d. -f1 || echo "")
+          echo "Detected clang version: $CLANG_VER"
+          for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+            if ! command -v $tool &>/dev/null; then
+              VERSIONED=$(ls /usr/bin/${tool}-* 2>/dev/null | sort -V | tail -1)
+              [ -n "$VERSIONED" ] && sudo ln -sf "$VERSIONED" "/usr/local/bin/$tool" && echo "Linked $VERSIONED -> $tool"
+            fi
+          done
           clang --version | head -1
 
       - name: Set up Clang toolchain
-        run: echo "Clang already installed via apt in previous step"
+        run: echo "Clang installed in previous step"
 
       - name: Clone kernel source
         run: |
