@@ -1,6 +1,8 @@
 name: Build KernelSU-Next for POCO X4 Pro 5G (veux/peux)
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       ksu_branch:
