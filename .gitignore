@@ -1,0 +1,11 @@
+# Large binary files - don't commit to git
+boot.img
+vendor_boot.img
+*.img
+kernel_xiaomi_sm6375-fourteen.zip
+*.zip
+*.tgz
+*.tar.gz
+
+# macOS
+.DS_Store

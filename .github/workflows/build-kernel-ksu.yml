@@ -1,0 +1,320 @@
+name: Build KernelSU-Next for POCO X4 Pro 5G (veux/peux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_branch:
+        description: 'KernelSU-Next branch'
+        required: false
+        default: 'next'
+
+jobs:
+  build:
+    name: Build Kernel + Repack boot.img
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+
+      # ── 1. Checkout repo ───────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Install build deps ──────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git curl wget zip unzip bc bison flex libssl-dev libelf-dev \
+            python3 cpio build-essential gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi make libncurses-dev lz4 zstd ccache
+
+      # ── 3. Download Clang toolchain ────────────────────────────────────────
+      - name: Set up Clang toolchain
+        run: |
+          mkdir -p $HOME/toolchains/clang
+          echo "Downloading ZyCromerZ Clang 17..."
+          wget -q --show-progress --progress=dot:giga \
+            "https://github.com/ZyCromerZ/Clang/releases/download/17.0.0-20231014-release/Clang-17.0.0-20231014.tar.gz" \
+            -O /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz -C $HOME/toolchains/clang
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+          $HOME/toolchains/clang/bin/clang --version | head -1
+
+      # ── 4. Clone kernel source ─────────────────────────────────────────────
+      - name: Clone kernel source
+        run: |
+          echo "Cloning kernel_xiaomi_sm6375 (branch: fourteen)..."
+          git clone --depth=1 \
+            https://github.com/PixelExperience-Devices/kernel_xiaomi_sm6375 \
+            -b fourteen \
+            $HOME/kernel
+          echo "Kernel version:"
+          head -5 $HOME/kernel/Makefile
+
+      # ── 5. Integrate KernelSU-Next ─────────────────────────────────────────
+      - name: Integrate KernelSU-Next
+        run: |
+          cd $HOME/kernel
+          echo "Integrating KernelSU-Next (branch: ${{ github.event.inputs.ksu_branch }})..."
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s ${{ github.event.inputs.ksu_branch }}
+          echo "KSU-Next setup complete."
+          ls KernelSU/
+
+      # ── 6. Patch defconfig ─────────────────────────────────────────────────
+      - name: Patch veux_defconfig
+        run: |
+          cd $HOME/kernel
+          DEFCONFIG="arch/arm64/configs/veux_defconfig"
+          # Remove any pre-existing KSU/KPROBES lines
+          sed -i '/CONFIG_KSU/d' "$DEFCONFIG"
+          sed -i '/CONFIG_KPROBES=/d' "$DEFCONFIG"
+          # Append KSU config (non-GKI manual hooks mode)
+          cat >> "$DEFCONFIG" <<'EOF'
+
+# KernelSU-Next non-GKI manual hooks
+CONFIG_KSU=y
+CONFIG_KSU_WITH_KPROBES=n
+CONFIG_KPROBES=n
+EOF
+          echo "Defconfig tail:"
+          tail -8 "$DEFCONFIG"
+
+      # ── 7. Apply manual KSU hooks ──────────────────────────────────────────
+      - name: Apply manual KSU hooks to kernel source
+        run: |
+          cd $HOME/kernel
+          python3 << 'PYEOF'
+          import re, sys, os
+
+          def patch_file(filepath, func_pattern, extern_block, hook_code, already_marker):
+              with open(filepath, 'r') as f:
+                  content = f.read()
+              if already_marker in content:
+                  print(f"  {filepath}: already patched, skipping")
+                  return
+              match = re.search(func_pattern, content, re.MULTILINE | re.DOTALL)
+              if not match:
+                  print(f"  ERROR: pattern not found in {filepath}")
+                  sys.exit(1)
+              # Insert extern block BEFORE the function
+              pos = match.start()
+              content = content[:pos] + extern_block + content[pos:]
+              # Find the function opening brace again and insert hook AFTER it
+              match2 = re.search(func_pattern, content, re.MULTILINE | re.DOTALL)
+              brace_pos = match2.end()
+              content = content[:brace_pos] + hook_code + content[brace_pos:]
+              with open(filepath, 'w') as f:
+                  f.write(content)
+              print(f"  {filepath}: patched OK")
+
+          # ── fs/exec.c ──────────────────────────────────────────────────────
+          patch_file(
+              'fs/exec.c',
+              r'static int do_execveat_common\(int fd,.*?\)\s*\n\{',
+              '#ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n\t\t\tvoid *envp, int *flags);\nextern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\t\t\t\t void *argv, void *envp, int *flags);\n#endif\n',
+              '\n\t#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n\t#endif',
+              'ksu_handle_execveat'
+          )
+
+          # ── fs/open.c ──────────────────────────────────────────────────────
+          # Try do_faccessat first, then fall back to SYSCALL_DEFINE3(faccessat)
+          with open('fs/open.c', 'r') as f:
+              oc = f.read()
+          if 'ksu_handle_faccessat' not in oc:
+              pat = r'long do_faccessat\(int dfd,.*?\)\s*\n\{'
+              if not re.search(pat, oc, re.MULTILINE | re.DOTALL):
+                  pat = r'SYSCALL_DEFINE3\(faccessat,.*?\)\s*\n\{'
+              patch_file(
+                  'fs/open.c', pat,
+                  '#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,\n\t\t\t int *flags);\n#endif\n',
+                  '\n\t#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n\t#endif',
+                  'ksu_handle_faccessat'
+              )
+          else:
+              print("  fs/open.c: already patched, skipping")
+
+          # ── fs/read_write.c ────────────────────────────────────────────────
+          patch_file(
+              'fs/read_write.c',
+              r'ssize_t vfs_read\(struct file \*file,.*?\)\s*\n\{',
+              '#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n\t\t\tsize_t *count_ptr, loff_t **pos);\n#endif\n',
+              '\n\t#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n\t#endif',
+              'ksu_handle_vfs_read'
+          )
+
+          # ── fs/stat.c ──────────────────────────────────────────────────────
+          with open('fs/stat.c', 'r') as f:
+              sc = f.read()
+          if 'ksu_handle_stat' not in sc:
+              pat = r'int vfs_statx\(int dfd,.*?\)\s*\n\{'
+              if not re.search(pat, sc, re.MULTILINE | re.DOTALL):
+                  pat = r'int vfs_fstatat\(int dfd,.*?\)\s*\n\{'
+              patch_file(
+                  'fs/stat.c', pat,
+                  '#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n',
+                  '\n\t#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n\t#endif',
+                  'ksu_handle_stat'
+              )
+          else:
+              print("  fs/stat.c: already patched, skipping")
+
+          # ── drivers/input/input.c ──────────────────────────────────────────
+          patch_file(
+              'drivers/input/input.c',
+              r'static void input_handle_event\(struct input_dev \*dev,.*?\)\s*\n\{',
+              '#ifdef CONFIG_KSU\nextern bool ksu_input_hook __read_mostly;\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n',
+              '\n\t#ifdef CONFIG_KSU\n\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n\t#endif',
+              'ksu_handle_input_handle_event'
+          )
+
+          # ── fs/devpts/inode.c ──────────────────────────────────────────────
+          with open('fs/devpts/inode.c', 'r') as f:
+              dc = f.read()
+          if 'ksu_handle_devpts' not in dc:
+              pat = r'void \*devpts_get_priv\(struct dentry \*dentry\)\s*\n\{'
+              if re.search(pat, dc, re.MULTILINE):
+                  patch_file(
+                      'fs/devpts/inode.c', pat,
+                      '#ifdef CONFIG_KSU\nextern int ksu_handle_devpts(struct inode*);\n#endif\n',
+                      '\n\t#ifdef CONFIG_KSU\n\tksu_handle_devpts(dentry->d_inode);\n\t#endif',
+                      'ksu_handle_devpts'
+                  )
+              else:
+                  print("  fs/devpts/inode.c: devpts_get_priv not found, skipping")
+          else:
+              print("  fs/devpts/inode.c: already patched, skipping")
+
+          print("\nAll hooks applied successfully!")
+          PYEOF
+
+      # ── 8. Verify all patches ──────────────────────────────────────────────
+      - name: Verify patches
+        run: |
+          cd $HOME/kernel
+          echo "=== Hook verification ==="
+          for f in "fs/exec.c:ksu_handle_execveat" \
+                   "fs/open.c:ksu_handle_faccessat" \
+                   "fs/read_write.c:ksu_handle_vfs_read" \
+                   "fs/stat.c:ksu_handle_stat" \
+                   "drivers/input/input.c:ksu_handle_input_handle_event"; do
+            FILE="${f%%:*}"; SYM="${f##*:}"
+            COUNT=$(grep -c "$SYM" "$FILE" 2>/dev/null || echo 0)
+            if [ "$COUNT" -gt 0 ]; then
+              echo "  ✅ $FILE ($COUNT occurrences of $SYM)"
+            else
+              echo "  ❌ MISSING: $FILE has no $SYM"
+              exit 1
+            fi
+          done
+          echo ""
+          echo "=== Defconfig KSU entries ==="
+          grep -E "CONFIG_KSU|CONFIG_KPROBES" arch/arm64/configs/veux_defconfig
+
+      # ── 9. Build kernel ────────────────────────────────────────────────────
+      - name: Build kernel
+        run: |
+          cd $HOME/kernel
+          export PATH="$HOME/toolchains/clang/bin:$PATH"
+
+          MAKE_ARGS=(
+            -j$(nproc)
+            O=out
+            ARCH=arm64
+            SUBARCH=arm64
+            CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+          )
+
+          echo "==> Step 1: generate .config from veux_defconfig"
+          make "${MAKE_ARGS[@]}" veux_defconfig 2>&1
+
+          echo "==> Step 2: build Image.gz ($(nproc) threads)"
+          make "${MAKE_ARGS[@]}" Image.gz 2>&1 | tee /tmp/build.log | grep -E "CC|LD|AR|OBJCOPY|error:|warning:.*error|^\s*$" | tail -80 || true
+
+          if [ -f "out/arch/arm64/boot/Image.gz" ]; then
+            echo "✅ Kernel built successfully!"
+            ls -lh out/arch/arm64/boot/Image.gz
+          else
+            echo "❌ Build FAILED. Last 150 lines:"
+            tail -150 /tmp/build.log
+            exit 1
+          fi
+
+      # ── 10. Get magiskboot ─────────────────────────────────────────────────
+      - name: Get magiskboot
+        run: |
+          wget -q "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk" \
+            -O /tmp/Magisk.apk
+          cd /tmp
+          unzip -qj Magisk.apk 'lib/x86_64/libmagiskboot.so' -d .
+          mv libmagiskboot.so magiskboot
+          chmod +x magiskboot
+          ./magiskboot --help 2>&1 | head -3 || true
+
+      # ── 11. Download stock boot.img from Xiaomi CDN ───────────────────────
+      - name: Download stock boot.img
+        run: |
+          mkdir -p /tmp/bootimg
+          cd /tmp/bootimg
+          echo "Downloading stock boot.img from Xiaomi CDN..."
+          # Download only the boot.img from inside the tgz using range/pipe
+          wget -q --show-progress --progress=dot:giga \
+            "https://bigota.d.miui.com/OS1.0.9.0.TKCINXM/veux_in_global_images_OS1.0.9.0.TKCINXM_20241212.0000.00_13.0_in_fb2147aa4b.tgz" \
+            -O rom.tgz || \
+          wget -q --show-progress --progress=dot:giga \
+            "https://bn.d.miui.com/OS1.0.9.0.TKCINXM/veux_in_global_images_OS1.0.9.0.TKCINXM_20241212.0000.00_13.0_in_fb2147aa4b.tgz" \
+            -O rom.tgz
+          echo "Extracting boot.img..."
+          tar -xzf rom.tgz --wildcards "*/images/boot.img" --strip-components=2
+          rm rom.tgz
+          ls -lh boot.img
+          # Verify magic
+          xxd boot.img | head -1
+
+      # ── 12. Repack boot.img ────────────────────────────────────────────────
+      - name: Repack boot.img with KSU kernel
+        run: |
+          cd /tmp/bootimg
+          echo "==> Unpacking stock boot.img..."
+          /tmp/magiskboot unpack boot.img
+          echo "Files after unpack:"
+          ls -lh
+
+          echo "==> Replacing kernel with KSU-patched Image.gz..."
+          cp $HOME/kernel/out/arch/arm64/boot/Image.gz kernel
+
+          echo "==> Repacking..."
+          /tmp/magiskboot repack boot.img KSU-Next_boot_veux_OS1.0.9.0.TKCINXM.img
+
+          echo "==> Final image:"
+          ls -lh KSU-Next_boot_veux_OS1.0.9.0.TKCINXM.img
+
+          cp KSU-Next_boot_veux_OS1.0.9.0.TKCINXM.img $GITHUB_WORKSPACE/
+
+      # ── 13. Upload artifacts ───────────────────────────────────────────────
+      - name: Upload KSU boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: KSU-Next-boot-veux-OS1.0.9.0.TKCINXM
+          path: KSU-Next_boot_veux_OS1.0.9.0.TKCINXM.img
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: ignore
+          retention-days: 7
