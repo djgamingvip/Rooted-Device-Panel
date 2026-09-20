@@ -27,19 +27,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git curl wget zip unzip bc bison flex libssl-dev libelf-dev \
             python3 cpio build-essential gcc-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi make libncurses-dev lz4 zstd
+            gcc-arm-linux-gnueabi make libncurses-dev lz4 zstd \
+            clang-17 lld-17 llvm-17
+          # Create unversioned symlinks
+          sudo ln -sf /usr/bin/clang-17 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-17 /usr/local/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-ar-17 /usr/local/bin/llvm-ar
+          sudo ln -sf /usr/bin/llvm-nm-17 /usr/local/bin/llvm-nm
+          sudo ln -sf /usr/bin/llvm-objcopy-17 /usr/local/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/llvm-objdump-17 /usr/local/bin/llvm-objdump
+          sudo ln -sf /usr/bin/llvm-strip-17 /usr/local/bin/llvm-strip
+          clang --version | head -1
 
       - name: Set up Clang toolchain
-        run: |
-          mkdir -p $HOME/toolchains/clang
-          echo "Fetching latest Neutron Clang..."
-          CLANG_URL=$(curl -s "https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/latest" \
-            | python3 -c "import sys,json; d=json.load(sys.stdin); print([a['browser_download_url'] for a in d['assets'] if a['name'].endswith('.tar.zst')][0])")
-          echo "Downloading: $CLANG_URL"
-          wget -q --show-progress --progress=dot:giga "$CLANG_URL" -O /tmp/clang.tar.zst
-          tar --use-compress-program=unzstd -xf /tmp/clang.tar.zst -C $HOME/toolchains/clang
-          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
-          $HOME/toolchains/clang/bin/clang --version | head -1
+        run: echo "Clang already installed via apt in previous step"
 
       - name: Clone kernel source
         run: |
