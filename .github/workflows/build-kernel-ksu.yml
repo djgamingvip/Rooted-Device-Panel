@@ -190,14 +190,10 @@ jobs:
       - name: Download stock boot.img
         run: |
           mkdir -p /tmp/bootimg && cd /tmp/bootimg
-          wget -q --show-progress --progress=dot:giga \
-            "https://bigota.d.miui.com/OS1.0.9.0.TKCINXM/veux_in_global_images_OS1.0.9.0.TKCINXM_20241212.0000.00_13.0_in_fb2147aa4b.tgz" \
-            -O rom.tgz || \
-          wget -q --show-progress --progress=dot:giga \
-            "https://bn.d.miui.com/OS1.0.9.0.TKCINXM/veux_in_global_images_OS1.0.9.0.TKCINXM_20241212.0000.00_13.0_in_fb2147aa4b.tgz" \
-            -O rom.tgz
-          tar -xzf rom.tgz --wildcards "*/images/boot.img" --strip-components=2
-          rm rom.tgz
+          echo "Downloading stock_boot.img from GitHub release..."
+          wget -q --show-progress --progress=dot:mega \
+            "https://github.com/djgamingvip/Rooted-Device-Panel/releases/download/boot-img-v1/stock_boot.img" \
+            -O boot.img
           ls -lh boot.img
           xxd boot.img | head -1
 
